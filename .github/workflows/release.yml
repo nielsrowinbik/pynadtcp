@@ -1,0 +1,105 @@
+name: Release
+
+# Publishes to PyPI whenever main has a version in pyproject.toml that isn't on PyPI yet.
+# To release: bump the version in pyproject.toml and pynadtcp/__init__.py, then merge to main.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.pypi.outputs.publish }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - name: Read version
+        id: version
+        run: |
+          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          module=$(python -c 'import re; print(re.search(r"__version__ = \"(.+)\"", open("pynadtcp/__init__.py").read())[1])')
+          if [ "$version" != "$module" ]; then
+            echo "::error::pyproject.toml has $version but pynadtcp/__init__.py has $module"
+            exit 1
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+      - name: Check PyPI
+        id: pypi
+        run: |
+          status=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/pynadtcp/${{ steps.version.outputs.version }}/json")
+          if [ "$status" = "404" ]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif [ "$status" = "200" ]; then
+            echo "Version ${{ steps.version.outputs.version }} is already on PyPI, nothing to release."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "::error::Unexpected response $status from PyPI"
+            exit 1
+          fi
+
+  test:
+    needs: check
+    if: needs.check.outputs.publish == 'true'
+    uses: ./.github/workflows/test.yml
+
+  build:
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+      - run: pip install build twine
+      - run: python -m build
+      - run: twine check --strict dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/project/pynadtcp/
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    needs: [check, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Tag and create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          gh release create "v$VERSION" dist/* \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v$VERSION" \
+            --generate-notes
