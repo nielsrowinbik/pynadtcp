@@ -28,6 +28,7 @@ class FakeNad:
         """Initialize the fake device."""
         self.received: list[str] = []
         self._server: asyncio.AbstractServer | None = None
+        self._writers: list[asyncio.StreamWriter] = []
         self.port = 0
 
     async def start(self) -> None:
@@ -38,6 +39,7 @@ class FakeNad:
     async def _handle(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        self._writers.append(writer)
         while not reader.at_eof():
             data = await reader.read(1024)
             if not data:
@@ -48,6 +50,12 @@ class FakeNad:
                 writer.write(STATE_DUMP.encode())
                 await writer.drain()
         writer.close()
+
+    async def push(self, text: str) -> None:
+        """Send unsolicited output to every connected client."""
+        for writer in self._writers:
+            writer.write(text.encode())
+            await writer.drain()
 
     async def stop(self) -> None:
         """Stop the server if it is still running."""
@@ -105,6 +113,19 @@ async def test_callbacks_fire(fake_nad: FakeNad) -> None:
 
     assert True in powers
     unsubscribe()
+    await client.disconnect()
+
+
+async def test_unparseable_lines_keep_connection(fake_nad: FakeNad) -> None:
+    """Bad lines are skipped; later valid lines still apply on the same connection."""
+    client = NadClient("127.0.0.1", port=fake_nad.port)
+    await client.connect()
+
+    await fake_nad.push("garbage\r\nMain.Unknown=1\r\nMain.Volume=-20\r\n")
+    await asyncio.sleep(0.05)
+
+    assert client.state.volume_db == -20.0
+    assert client.is_connected()
     await client.disconnect()
 
 
@@ -166,6 +187,8 @@ async def test_no_response_times_out() -> None:
     ) -> None:
         await reader.read(1024)
         await asyncio.sleep(5)
+        # Without this, wait_closed() below hangs on Python 3.12.
+        writer.close()
 
     server = await asyncio.start_server(_silent, "127.0.0.1", 0)
     port = server.sockets[0].getsockname()[1]
