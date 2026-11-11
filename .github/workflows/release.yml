@@ -1,7 +1,12 @@
 name: Release
 
-# Publishes to PyPI whenever main has a version in pyproject.toml that isn't on PyPI yet.
-# To release: bump the version in pyproject.toml and pynadtcp/__init__.py, then merge to main.
+# On every push to main, semantic-release reads the Conventional Commit messages since
+# the last tag. If they call for a release, it sets the version in pyproject.toml and
+# pynadtcp/__init__.py, builds the package, updates CHANGELOG.md, commits with [skip ci],
+# and creates the tag and GitHub Release. The publish job then uploads the build to PyPI.
+#
+# The PyPI trusted publisher is configured for this file name (release.yml) and the
+# `pypi` environment. Renaming either breaks publishing until PyPI is updated to match.
 
 on:
   push:
@@ -13,63 +18,58 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  check:
-    runs-on: ubuntu-latest
-    outputs:
-      version: ${{ steps.version.outputs.version }}
-      publish: ${{ steps.pypi.outputs.publish }}
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.14"
-      - name: Read version
-        id: version
-        run: |
-          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
-          module=$(python -c 'import re; print(re.search(r"__version__ = \"(.+)\"", open("pynadtcp/__init__.py").read())[1])')
-          if [ "$version" != "$module" ]; then
-            echo "::error::pyproject.toml has $version but pynadtcp/__init__.py has $module"
-            exit 1
-          fi
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-      - name: Check PyPI
-        id: pypi
-        run: |
-          status=$(curl -s -o /dev/null -w '%{http_code}' "https://pypi.org/pypi/pynadtcp/${{ steps.version.outputs.version }}/json")
-          if [ "$status" = "404" ]; then
-            echo "publish=true" >> "$GITHUB_OUTPUT"
-          elif [ "$status" = "200" ]; then
-            echo "Version ${{ steps.version.outputs.version }} is already on PyPI, nothing to release."
-            echo "publish=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "::error::Unexpected response $status from PyPI"
-            exit 1
-          fi
-
   test:
-    needs: check
-    if: needs.check.outputs.publish == 'true'
     uses: ./.github/workflows/test.yml
 
-  build:
+  release:
     needs: test
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    outputs:
+      published: ${{ steps.dist.outputs.published }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # Deploy key allowed to bypass the branch ruleset on main. Without the
+          # secret, checkout falls back to GITHUB_TOKEN, which works only while
+          # main is unprotected.
+          ssh-key: ${{ secrets.RELEASE_DEPLOY_KEY }}
       - uses: actions/setup-python@v5
         with:
           python-version: "3.14"
       - run: pip install build twine
-      - run: python -m build
-      - run: twine check --strict dist/*
-      - uses: actions/upload-artifact@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: >-
+          npx --yes
+          -p semantic-release@25.0.9
+          -p @semantic-release/changelog@7.0.0
+          -p @semantic-release/exec@7.1.0
+          -p @semantic-release/git@11.0.1
+          -p conventional-changelog-conventionalcommits@9.3.1
+          semantic-release
+      # dist/ only exists when semantic-release made a release.
+      - name: Check for a new release
+        id: dist
+        run: |
+          if [ -d dist ]; then echo "published=true" >> "$GITHUB_OUTPUT"; else echo "published=false" >> "$GITHUB_OUTPUT"; fi
+      - if: steps.dist.outputs.published == 'true'
+        uses: actions/upload-artifact@v4
         with:
           name: dist
           path: dist/
 
   publish:
-    needs: build
+    needs: release
+    if: needs.release.outputs.published == 'true'
     runs-on: ubuntu-latest
     environment:
       name: pypi
@@ -82,24 +82,3 @@ jobs:
           name: dist
           path: dist/
       - uses: pypa/gh-action-pypi-publish@release/v1
-
-  github-release:
-    needs: [check, publish]
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/download-artifact@v4
-        with:
-          name: dist
-          path: dist/
-      - name: Tag and create GitHub Release
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ needs.check.outputs.version }}
-        run: |
-          gh release create "v$VERSION" dist/* \
-            --repo "$GITHUB_REPOSITORY" \
-            --target "$GITHUB_SHA" \
-            --title "v$VERSION" \
-            --generate-notes
